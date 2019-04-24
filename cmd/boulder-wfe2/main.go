@@ -52,6 +52,10 @@ type config struct {
 		// slice of filenames.
 		CertificateChains map[string][]string
 
+		// AlternateCertificateChains serves the same purpose as CertificateChains,
+		// except to construct an alternate certificate chain for any AIA Issuer URL.
+		AlternateCertificateChains map[string][]string
+
 		Features map[string]bool
 
 		// DirectoryCAAIdentity is used for the /directory response's "meta"
@@ -210,6 +214,9 @@ func main() {
 	certChains, err := loadCertificateChains(c.WFE.CertificateChains)
 	cmd.FailOnError(err, "Couldn't read configured CertificateChains")
 
+	altCertChains, err := loadCertificateChains(c.WFE.AlternateCertificateChains)
+	cmd.FailOnError(err, "Couldn't read configured AlternateCertificateChains")
+
 	err = features.Set(c.WFE.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
@@ -221,7 +228,7 @@ func main() {
 
 	kp, err := goodkey.NewKeyPolicy("") // don't load any weak keys
 	cmd.FailOnError(err, "Unable to create key policy")
-	wfe, err := wfe2.NewWebFrontEndImpl(scope, clk, kp, certChains, logger)
+	wfe, err := wfe2.NewWebFrontEndImpl(scope, clk, kp, certChains, altCertChains, logger)
 	cmd.FailOnError(err, "Unable to create WFE")
 	rac, sac := setupWFE(c, logger, scope, clk)
 	wfe.RA = rac

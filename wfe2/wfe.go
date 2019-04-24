@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +76,11 @@ type WebFrontEndImpl struct {
 	// sorted from leaf to root
 	certificateChains map[string][]byte
 
+	// alternateCertificateChains works identically to certificateChains but serves
+	// an alternate chain of certificates for any AIA issuer URL that may be used
+	// when downloading a certificate as per RFC8555 Section 7.4.2.
+	alternateCertificateChains map[string][]byte
+
 	// URL to the current subscriber agreement (should contain some version identifier)
 	SubscriberAgreementURL string
 
@@ -116,6 +120,7 @@ func NewWebFrontEndImpl(
 	clk clock.Clock,
 	keyPolicy goodkey.KeyPolicy,
 	certificateChains map[string][]byte,
+	alternateCertificateChains map[string][]byte,
 	logger blog.Logger,
 ) (WebFrontEndImpl, error) {
 	nonceService, err := nonce.NewNonceService(scope)
@@ -124,13 +129,14 @@ func NewWebFrontEndImpl(
 	}
 
 	return WebFrontEndImpl{
-		log:               logger,
-		clk:               clk,
-		nonceService:      nonceService,
-		keyPolicy:         keyPolicy,
-		certificateChains: certificateChains,
-		stats:             initStats(scope),
-		scope:             scope,
+		log:                        logger,
+		clk:                        clk,
+		nonceService:               nonceService,
+		keyPolicy:                  keyPolicy,
+		certificateChains:          certificateChains,
+		alternateCertificateChains: alternateCertificateChains,
+		stats:                      initStats(scope),
+		scope:                      scope,
 	}, nil
 }
 
@@ -1373,7 +1379,7 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 	}
 }
 
-var allHex = regexp.MustCompile("^[0-9a-f]+$")
+const alternateSuffix = "/alternate"
 
 // Certificate is used by clients to request a copy of their current certificate, or to
 // request a reissuance of the certificate.
@@ -1390,7 +1396,17 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 		requesterAccount = acct
 	}
 
+	// If the request path ends with /alternate, then the request is
+	// asking for the certificate chain to be constructed from
+	// alternateCertificateChains ("alternate" relation).
+	isAlternateChainRequested := false
+	isAlternateChainAvailable := false
 	serial := request.URL.Path
+	if strings.HasSuffix(serial, alternateSuffix) {
+		serial = serial[:len(serial)-len(alternateSuffix)]
+		isAlternateChainRequested = true
+	}
+
 	// Certificate paths consist of the CertBase path, plus exactly sixteen hex
 	// digits.
 	if !core.ValidSerial(serial) {
@@ -1431,9 +1447,14 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 
 	var responsePEM []byte
 
+	chains := wfe.certificateChains
+	if isAlternateChainRequested {
+		chains = wfe.alternateCertificateChains
+	}
+
 	// If the WFE is configured with certificateChains, construct a chain for this
 	// certificate using its AIA Issuer URL.
-	if len(wfe.certificateChains) > 0 {
+	if len(chains) > 0 {
 		parsedCert, err := x509.ParseCertificate(cert.DER)
 		if err != nil {
 			// If we can't parse one of our own certs there's a serious problem
@@ -1450,13 +1471,16 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 		// the CA, but should be. See
 		//  https://github.com/letsencrypt/boulder/issues/3374
 		aiaIssuerURL := parsedCert.IssuingCertificateURL[0]
-		if chain, ok := wfe.certificateChains[aiaIssuerURL]; ok {
+		// Record whether an alternate chain would be available for this AIA Issuer URL,
+		// so we can send an "alternate" relation in the response
+		_, isAlternateChainAvailable = wfe.alternateCertificateChains[aiaIssuerURL]
+
+		if chain, ok := chains[aiaIssuerURL]; ok {
 			// Prepend the chain with the leaf certificate
 			responsePEM = append(leafPEM, chain...)
 		} else {
-			// If there is no wfe.certificateChains entry for the AIA Issuer URL there
-			// is probably a misconfiguration and we should treat it as an internal
-			// server error.
+			// If there is no chains entry for the AIA Issuer URL there is probably
+			// a misconfiguration and we should treat it as an internal server error.
 			wfe.sendError(response, logEvent, probs.ServerInternal(
 				fmt.Sprintf(
 					"Certificate serial %#v has an unknown AIA Issuer URL %q"+
@@ -1479,6 +1503,10 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 	// reliably set it ourselves and not worry.
 	response.Header().Set("Content-Length", strconv.Itoa(len(responsePEM)))
 	response.Header().Set("Content-Type", "application/pem-certificate-chain")
+	// Send an "alternate" relation for an alternative certificate chain, if it is available
+	if !isAlternateChainRequested && isAlternateChainAvailable {
+		response.Header().Set("Link", link(web.RelativeEndpoint(request, certPath+serial+alternateSuffix), "alternate"))
+	}
 	response.WriteHeader(http.StatusOK)
 	if _, err = response.Write(responsePEM); err != nil {
 		wfe.log.Warningf("Could not write response: %s", err)
