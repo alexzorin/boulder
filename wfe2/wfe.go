@@ -1505,7 +1505,7 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 	response.Header().Set("Content-Type", "application/pem-certificate-chain")
 	// Send an "alternate" relation for an alternative certificate chain, if it is available
 	if !isAlternateChainRequested && isAlternateChainAvailable {
-		response.Header().Set("Link", link(web.RelativeEndpoint(request, certPath+serial+alternateSuffix), "alternate"))
+		response.Header().Add("Link", link(web.RelativeEndpoint(request, certPath+serial+alternateSuffix), "alternate"))
 	}
 	response.WriteHeader(http.StatusOK)
 	if _, err = response.Write(responsePEM); err != nil {
